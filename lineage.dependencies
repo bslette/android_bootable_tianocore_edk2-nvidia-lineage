@@ -1,0 +1,54 @@
+[
+ {
+   "repository": "android_bootable_tianocore_edk2",
+   "target_path": "bootable/tianocore/edk2"
+ },
+ {
+   "repository": "android_bootable_tianocore_cmocka",
+   "target_path": "bootable/tianocore/edk2/UnitTestFrameworkPkg/Library/CmockaLib/cmocka"
+ },
+ {
+   "repository": "android_bootable_tianocore_googletest",
+   "target_path": "bootable/tianocore/edk2/UnitTestFrameworkPkg/Library/GoogleTestLib/googletest"
+ },
+ {
+   "repository": "android_bootable_tianocore_jansson",
+   "target_path": "bootable/tianocore/edk2/RedfishPkg/Library/JsonLib/jansson"
+ },
+ {
+   "repository": "android_bootable_tianocore_libspdm",
+   "target_path": "bootable/tianocore/edk2/SecurityPkg/DeviceSecurity/SpdmLib/libspdm"
+ },
+ {
+   "repository": "android_bootable_tianocore_mbedtls",
+   "target_path": "bootable/tianocore/edk2/CryptoPkg/Library/MbedTlsLib/mbedtls"
+ },
+ {
+   "repository": "android_bootable_tianocore_mipisyst",
+   "target_path": "bootable/tianocore/edk2/MdePkg/Library/MipiSysTLib/mipisyst"
+ },
+ {
+   "repository": "android_bootable_tianocore_openssl",
+   "target_path": "bootable/tianocore/edk2/CryptoPkg/Library/OpensslLib/openssl"
+ },
+ {
+   "repository": "android_bootable_tianocore_pylibfdt",
+   "target_path": "bootable/tianocore/edk2/MdePkg/Library/BaseFdtLib/libfdt"
+ },
+ {
+   "repository": "android_bootable_tianocore_edk2-non-osi",
+   "target_path": "bootable/tianocore/edk2-non-osi"
+ },
+ {
+   "repository": "android_bootable_tianocore_edk2-nvidia",
+   "target_path": "bootable/tianocore/edk2-nvidia"
+ },
+ {
+   "repository": "android_bootable_tianocore_edk2-nvidia-non-osi",
+   "target_path": "bootable/tianocore/edk2-nvidia-non-osi"
+ },
+ {
+   "repository": "android_bootable_tianocore_edk2-platforms",
+   "target_path": "bootable/tianocore/edk2-platforms"
+ }
+]
