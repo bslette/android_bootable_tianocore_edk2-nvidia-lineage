@@ -256,8 +256,10 @@ GetBootRecovery (
   switch (TegraGetChipID ()) {
     case T234_CHIP_ID:
       Address = FixedPcdGet64 (PcdScratch0RegisterBaseAddressT234);
+      break;
     case T194_CHIP_ID:
       Address = FixedPcdGet64 (PcdScratch0RegisterBaseAddressT194);
+      break;
     default:
       return EFI_UNSUPPORTED;
   }
