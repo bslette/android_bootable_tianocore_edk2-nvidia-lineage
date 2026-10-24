@@ -144,6 +144,9 @@
 !ifdef $(BOOT_TO_RECOVERY)
   gNVIDIATokenSpaceGuid.PcdBootToRecovery|TRUE
 !endif
+!ifdef $(SMD_BOOT_CONTROL)
+  gNVIDIATokenSpaceGuid.PcdRootfsRetryValidation|FALSE
+!endif
 
 ################################################################################
 #

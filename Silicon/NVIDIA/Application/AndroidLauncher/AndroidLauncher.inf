@@ -67,6 +67,7 @@
   gNVIDIATokenSpaceGuid.PcdScratch0RegisterBaseAddressT194
   gNVIDIATokenSpaceGuid.PcdScratch0RegisterBaseAddressT234
   gNVIDIATokenSpaceGuid.PcdBootToRecovery
+  gNVIDIATokenSpaceGuid.PcdRootfsRetryValidation
 
 [Pcd]
   gNVIDIATokenSpaceGuid.PcdSignedImageHeaderSize

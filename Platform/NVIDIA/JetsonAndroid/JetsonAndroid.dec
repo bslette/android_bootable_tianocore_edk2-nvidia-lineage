@@ -20,3 +20,6 @@
 
 #Force Boot to Recovery
   gNVIDIATokenSpaceGuid.PcdBootToRecovery|FALSE|BOOLEAN|0x00009902
+
+#Decrement RootfsRetrySlot<A|B> and switch boot chains in the launcher (needs an EFI boot HAL)
+  gNVIDIATokenSpaceGuid.PcdRootfsRetryValidation|TRUE|BOOLEAN|0x00009903

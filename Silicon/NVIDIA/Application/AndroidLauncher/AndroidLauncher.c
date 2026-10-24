@@ -351,10 +351,14 @@ ProcessBootParams (
     }
   }
 
-  // Find valid Rootfs Chain. If not, select recovery kernel
-  Status = ValidateRootfsStatus (BootParams);
-  if (EFI_ERROR (Status)) {
-    ErrorPrint (L"Failed to validate rootfs status: %r\r\n", Status);
+  // Find valid Rootfs Chain. If not, select recovery kernel.
+  // Without an Android boot HAL that resets RootfsRetrySlot<A|B>, this flips the boot chain
+  // after three boots; targets whose HAL keeps slot state in SMD (MB1 picks the chain) leave it off.
+  if (FixedPcdGetBool (PcdRootfsRetryValidation)) {
+    Status = ValidateRootfsStatus (BootParams);
+    if (EFI_ERROR (Status)) {
+      ErrorPrint (L"Failed to validate rootfs status: %r\r\n", Status);
+    }
   }
 
   // Store the current boot chain in volatile variable to allow chain loading
