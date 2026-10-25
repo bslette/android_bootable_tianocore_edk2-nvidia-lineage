@@ -85,4 +85,41 @@ typedef struct {
 } VENDOR_BOOTIMG_HEADER;
 #pragma pack()
 
+//
+// cboot slot metadata (hardware/nvidia/boot_control bootctrl_nvidia.h). Its location is in
+// the T194 BR BCT; the r35 MB1 does not read it, the launcher applies it to the boot chain.
+//
+#define BOOT_FW_NEXT_VARIABLE_NAME    L"BootChainFwNext"
+#define BOOT_FW_STATUS_VARIABLE_NAME  L"BootChainFwStatus"
+#define SMD_SWITCH_VARIABLE_NAME      L"AndroidLauncherSmdSwitch"
+#define SMD_INFO_OFFSET_T194          0x7DC
+#define SMD_STORAGE_QSPI              3
+#define SMD_MAGIC                     SIGNATURE_32 (0, 'N', 'B', 'C')
+#define SMD_NUM_SLOTS                 2
+#define SMD_MAX_RETRY                 7
+
+#pragma pack(1)
+typedef struct {
+  UINT16    DeviceType;
+  UINT16    DeviceInstance;
+  UINT32    StartSector;
+  UINT32    PartitionSize;
+} SMD_INFO;
+
+typedef struct {
+  UINT8    Priority;          // 0: unbootable, 15: highest
+  CHAR8    Suffix[2];
+  UINT8    RetryCount;
+  UINT8    BootSuccessful;
+} SMD_SLOT_INFO;
+
+typedef struct {
+  UINT32           Magic;
+  UINT16           Version;
+  UINT16           NumSlots;
+  SMD_SLOT_INFO    Slot[SMD_NUM_SLOTS];
+  UINT32           Crc32;
+} SMD_PARTITION;
+#pragma pack()
+
 #endif /* __ANDROID_LAUNCHER_H_ */

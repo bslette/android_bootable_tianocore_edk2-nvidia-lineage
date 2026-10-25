@@ -62,6 +62,7 @@
   gEfiBlockIoProtocolGuid
   gEfiDiskIoProtocolGuid
   gEfiLoadFile2ProtocolGuid
+  gNVIDIANorFlashProtocolGuid
 
 [FixedPcd]
   gEfiMdeModulePkgTokenSpaceGuid.PcdFirmwareVersionString

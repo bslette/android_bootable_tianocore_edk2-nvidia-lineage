@@ -21,6 +21,8 @@
 #include <Library/DevicePathLib.h>
 #include <Library/AndroidBootImgLib.h>
 #include <Library/IoLib.h>
+#include <Library/TimerLib.h>
+#include <Library/ResetSystemLib.h>
 #include <Library/TegraPlatformInfoLib.h>
 
 #include <Protocol/DevicePath.h>
@@ -30,6 +32,7 @@
 #include <Protocol/BlockIo.h>
 #include <Protocol/DiskIo.h>
 #include <Protocol/LoadFile2.h>
+#include <Protocol/NorFlash.h>
 
 #include <Guid/LinuxEfiInitrdMedia.h>
 
@@ -275,6 +278,172 @@ GetBootRecovery (
 }
 
 /**
+  Rewrite Size bytes at Offset of the NOR flash, preserving the rest of the erase block
+
+**/
+STATIC
+EFI_STATUS
+EFIAPI
+NorFlashUpdate (
+  IN NVIDIA_NOR_FLASH_PROTOCOL  *NorFlash,
+  IN UINT32                     BlockSize,
+  IN UINT32                     Offset,
+  IN UINT32                     Size,
+  IN VOID                       *Data
+  )
+{
+  EFI_STATUS  Status;
+  UINT32      Block;
+  UINT8       *Buffer;
+
+  Block = Offset / BlockSize;
+  if ((Offset % BlockSize) + Size > BlockSize) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  Buffer = AllocatePool (BlockSize);
+  if (Buffer == NULL) {
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  Status = NorFlash->Read (NorFlash, Block * BlockSize, BlockSize, Buffer);
+  if (!EFI_ERROR (Status)) {
+    CopyMem (Buffer + (Offset % BlockSize), Data, Size);
+    Status = NorFlash->Erase (NorFlash, Block, 1);
+  }
+
+  if (!EFI_ERROR (Status)) {
+    Status = NorFlash->Write (NorFlash, Block * BlockSize, BlockSize, Buffer);
+  }
+
+  FreePool (Buffer);
+  return Status;
+}
+
+/**
+  Pick the boot chain from the cboot slot metadata (SMD) on QSPI
+
+  The Android SMD boot HAL sets slot priorities, retry counts and the successful flag
+  as it did under cboot, but the r35 MB1 boots whatever chain the BR BCT names. Apply
+  the cboot rules here: boot the highest priority slot that is not out of retries,
+  spend one retry per boot of a slot not yet marked successful, and when the wanted
+  slot is not the running chain, request the switch from BootChainDxe and reset.
+
+  @param[in]  BootParams      The current boot parameters
+
+**/
+STATIC
+VOID
+EFIAPI
+SmdSelectBootChain (
+  IN L4T_BOOT_PARAMS  *BootParams
+  )
+{
+  EFI_STATUS                 Status;
+  NVIDIA_NOR_FLASH_PROTOCOL  *NorFlash;
+  NOR_FLASH_ATTRIBUTES       Attributes;
+  SMD_INFO                   Info;
+  SMD_PARTITION              Smd;
+  UINT32                     Offset;
+  UINT32                     Index;
+  UINT32                     Wanted;
+  UINT8                      Priority;
+  UINT32                     Next;
+  UINT32                     Pending;
+  UINTN                      DataSize;
+
+  Status = gBS->LocateProtocol (&gNVIDIANorFlashProtocolGuid, NULL, (VOID **)&NorFlash);
+  if (!EFI_ERROR (Status)) {
+    Status = NorFlash->GetAttributes (NorFlash, &Attributes);
+  }
+
+  if (!EFI_ERROR (Status)) {
+    Status = NorFlash->Read (NorFlash, SMD_INFO_OFFSET_T194, sizeof (Info), &Info);
+  }
+
+  if (EFI_ERROR (Status) || (Info.DeviceType != SMD_STORAGE_QSPI) || (Info.StartSector == 0)) {
+    ErrorPrint (L"%a: No slot metadata on QSPI: %r\r\n", __FUNCTION__, Status);
+    return;
+  }
+
+  Offset = Info.StartSector * 512;
+  Status = NorFlash->Read (NorFlash, Offset, sizeof (Smd), &Smd);
+  if (EFI_ERROR (Status) || (Smd.Magic != SMD_MAGIC) || (Smd.NumSlots != SMD_NUM_SLOTS) ||
+      (CalculateCrc32 (&Smd, OFFSET_OF (SMD_PARTITION, Crc32)) != Smd.Crc32))
+  {
+    ErrorPrint (L"%a: Slot metadata invalid, keeping boot chain %u\r\n", __FUNCTION__, BootParams->BootChain);
+    return;
+  }
+
+  Wanted   = MAX_UINT32;
+  Priority = 0;
+  for (Index = 0; Index < SMD_NUM_SLOTS; Index++) {
+    if ((Smd.Slot[Index].Priority > Priority) &&
+        (Smd.Slot[Index].BootSuccessful || (Smd.Slot[Index].RetryCount > 0)))
+    {
+      Priority = Smd.Slot[Index].Priority;
+      Wanted   = Index;
+    }
+  }
+
+  if (Wanted == MAX_UINT32) {
+    ErrorPrint (L"%a: No bootable slot, keeping boot chain %u\r\n", __FUNCTION__, BootParams->BootChain);
+    return;
+  }
+
+  // A switch requested on the previous boot that did not happen must not loop: boot on.
+  DataSize = sizeof (Pending);
+  if (!EFI_ERROR (gRT->GetVariable (SMD_SWITCH_VARIABLE_NAME, &gNVIDIAPublicVariableGuid, NULL, &DataSize, &Pending))) {
+    gRT->SetVariable (SMD_SWITCH_VARIABLE_NAME, &gNVIDIAPublicVariableGuid, 0, 0, NULL);
+    if ((Pending == Wanted) && (Wanted != BootParams->BootChain)) {
+      ErrorPrint (L"%a: Switch to boot chain %u failed, booting chain %u\r\n", __FUNCTION__, Wanted, BootParams->BootChain);
+      return;
+    }
+  }
+
+  if (Wanted != BootParams->BootChain) {
+    Print (L"Slot metadata selects slot %c: switching the boot chain\r\n", L'a' + Wanted);
+    Pending = Wanted;
+    gRT->SetVariable (
+           SMD_SWITCH_VARIABLE_NAME,
+           &gNVIDIAPublicVariableGuid,
+           EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_BOOTSERVICE_ACCESS,
+           sizeof (Pending),
+           &Pending
+           );
+    Next   = Wanted;
+    Status = gRT->SetVariable (
+                    BOOT_FW_NEXT_VARIABLE_NAME,
+                    &gNVIDIAPublicVariableGuid,
+                    EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_RUNTIME_ACCESS,
+                    sizeof (Next),
+                    &Next
+                    );
+    if (EFI_ERROR (Status)) {
+      ErrorPrint (L"%a: Failed to set %s: %r\r\n", __FUNCTION__, BOOT_FW_NEXT_VARIABLE_NAME, Status);
+      return;
+    }
+
+    gRT->SetVariable (BOOT_FW_STATUS_VARIABLE_NAME, &gNVIDIAPublicVariableGuid, 0, 0, NULL);
+    MicroSecondDelay (2 * 1000 * 1000);
+    ResetCold ();
+  }
+
+  if (!Smd.Slot[Wanted].BootSuccessful && (Smd.Slot[Wanted].RetryCount > 0)) {
+    Smd.Slot[Wanted].RetryCount--;
+    Smd.Crc32 = CalculateCrc32 (&Smd, OFFSET_OF (SMD_PARTITION, Crc32));
+    Status    = NorFlashUpdate (NorFlash, Attributes.BlockSize, Offset, sizeof (Smd), &Smd);
+    if (!EFI_ERROR (Status)) {
+      Status = NorFlashUpdate (NorFlash, Attributes.BlockSize, Offset + Info.PartitionSize, sizeof (Smd), &Smd);
+    }
+
+    if (EFI_ERROR (Status)) {
+      ErrorPrint (L"%a: Failed to update slot metadata: %r\r\n", __FUNCTION__, Status);
+    }
+  }
+}
+
+/**
   Process the boot mode selection from command line and variables
 
   @param[in]  LoadedImage     The LoadedImage protocol for this execution
@@ -360,6 +529,8 @@ ProcessBootParams (
     if (EFI_ERROR (Status)) {
       ErrorPrint (L"Failed to validate rootfs status: %r\r\n", Status);
     }
+  } else {
+    SmdSelectBootChain (BootParams);
   }
 
   // Store the current boot chain in volatile variable to allow chain loading
