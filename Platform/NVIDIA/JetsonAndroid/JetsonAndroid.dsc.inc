@@ -148,6 +148,12 @@
   gNVIDIATokenSpaceGuid.PcdRootfsRetryValidation|FALSE
 !endif
 
+[PcdsDynamicDefault.common]
+!ifdef $(SMD_BOOT_CONTROL)
+  # The SMD boot HAL reads and writes the slot metadata on QSPI: keep the QSPI in the kernel DT
+  gNVIDIATokenSpaceGuid.PcdAllowOsAccessQspi|TRUE
+!endif
+
 ################################################################################
 #
 # Components Section - list of all EDK II Modules needed by this Platform

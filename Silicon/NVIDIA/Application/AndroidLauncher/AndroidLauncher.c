@@ -761,6 +761,12 @@ BootAndroidV3Image (
     );
   AppendCmdline (Cmdline, Args, sizeof (Args));
 
+  // With the QSPI handed to the OS, UEFI runtime variable writes would race the kernel
+  // QSPI driver on the same controller: give the OS no runtime services.
+  if (PcdGetBool (PcdAllowOsAccessQspi)) {
+    AppendCmdline (Cmdline, "efi=noruntime", sizeof ("efi=noruntime"));
+  }
+
   Status = AsciiStrToUnicodeStrS (Cmdline, Cmdline16, MAX_KERNEL_CMDLINE_SIZE);
   if (EFI_ERROR (Status)) {
     goto Exit;
