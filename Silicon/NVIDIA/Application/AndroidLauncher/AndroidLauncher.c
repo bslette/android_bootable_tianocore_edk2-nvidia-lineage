@@ -29,6 +29,7 @@
 #include <Protocol/AndroidBootImg.h>
 #include <Protocol/BlockIo.h>
 #include <Protocol/DiskIo.h>
+#include <Protocol/LoadFile2.h>
 
 #include <Guid/LinuxEfiInitrdMedia.h>
 
@@ -370,6 +371,492 @@ ProcessBootParams (
   return EFI_SUCCESS;
 }
 
+#pragma pack(1)
+typedef struct {
+  VENDOR_DEVICE_PATH          VenMediaNode;
+  EFI_DEVICE_PATH_PROTOCOL    EndNode;
+} INITRD_DEVICE_PATH;
+
+typedef struct {
+  MEMMAP_DEVICE_PATH          Node1;
+  EFI_DEVICE_PATH_PROTOCOL    End;
+} KERNEL_DEVICE_PATH;
+#pragma pack()
+
+STATIC CONST INITRD_DEVICE_PATH  mInitrdDevicePath = {
+  {
+    { MEDIA_DEVICE_PATH,    MEDIA_VENDOR_DP,                { sizeof (VENDOR_DEVICE_PATH), 0 }
+    },
+    LINUX_EFI_INITRD_MEDIA_GUID
+  },
+  {
+    END_DEVICE_PATH_TYPE,   END_ENTIRE_DEVICE_PATH_SUBTYPE,
+    { sizeof (EFI_DEVICE_PATH_PROTOCOL), 0 }
+  }
+};
+
+STATIC CONST KERNEL_DEVICE_PATH  mKernelDevicePathTemplate = {
+  {
+    { HARDWARE_DEVICE_PATH, HW_MEMMAP_DP,                   { sizeof (MEMMAP_DEVICE_PATH), 0 }
+    },
+    EfiBootServicesData,
+    0,
+    0
+  },
+  {
+    END_DEVICE_PATH_TYPE,   END_ENTIRE_DEVICE_PATH_SUBTYPE,
+    { sizeof (EFI_DEVICE_PATH_PROTOCOL), 0 }
+  }
+};
+
+STATIC VOID   *mInitrd;
+STATIC UINTN  mInitrdSize;
+
+/**
+  LoadFile2 for the Linux initrd media device path: hands the combined ramdisk to the
+  kernel EFI stub.
+
+**/
+STATIC
+EFI_STATUS
+EFIAPI
+InitrdLoadFile2 (
+  IN EFI_LOAD_FILE2_PROTOCOL   *This,
+  IN EFI_DEVICE_PATH_PROTOCOL  *FilePath,
+  IN BOOLEAN                   BootPolicy,
+  IN OUT UINTN                 *BufferSize,
+  IN VOID                      *Buffer OPTIONAL
+  )
+{
+  if (BootPolicy) {
+    return EFI_UNSUPPORTED;
+  }
+
+  if ((BufferSize == NULL) || !IsDevicePathValid (FilePath, 0)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  if ((FilePath->Type != END_DEVICE_PATH_TYPE) ||
+      (FilePath->SubType != END_ENTIRE_DEVICE_PATH_SUBTYPE))
+  {
+    return EFI_NOT_FOUND;
+  }
+
+  if ((Buffer == NULL) || (*BufferSize < mInitrdSize)) {
+    *BufferSize = mInitrdSize;
+    return EFI_BUFFER_TOO_SMALL;
+  }
+
+  CopyMem (Buffer, mInitrd, mInitrdSize);
+  *BufferSize = mInitrdSize;
+  return EFI_SUCCESS;
+}
+
+STATIC EFI_LOAD_FILE2_PROTOCOL  mInitrdLoadFile2 = {
+  InitrdLoadFile2
+};
+
+/**
+  Get the size of a boot image of any header version
+
+  @param[in]  Header     Start of the boot image
+  @param[out] ImageSize  Bytes to read from the partition
+
+  @retval EFI_SUCCESS    The operation completed successfully.
+
+**/
+STATIC
+EFI_STATUS
+EFIAPI
+GetBootImgSize (
+  IN  ANDROID_BOOTIMG_HEADER  *Header,
+  OUT UINTN                   *ImageSize
+  )
+{
+  ANDROID_BOOTIMG_V3_HEADER  *V3Header;
+
+  // HeaderVersion is at the same offset in every header version (Reserved[0] in v0).
+  V3Header = (ANDROID_BOOTIMG_V3_HEADER *)Header;
+  if ((CompareMem (V3Header->BootMagic, ANDROID_BOOT_MAGIC, ANDROID_BOOT_MAGIC_LENGTH) == 0) &&
+      (V3Header->HeaderVersion >= 3))
+  {
+    *ImageSize = ANDROID_BOOTIMG_V3_PAGE_SIZE +
+                 ALIGN_VALUE (V3Header->KernelSize, ANDROID_BOOTIMG_V3_PAGE_SIZE) +
+                 ALIGN_VALUE (V3Header->RamdiskSize, ANDROID_BOOTIMG_V3_PAGE_SIZE);
+    return EFI_SUCCESS;
+  }
+
+  return AndroidBootImgGetImgSize (Header, ImageSize);
+}
+
+/**
+  Read the vendor_boot image of the boot chain
+
+  @param[in]  DeviceHandle  The handle of partition where this file lives on.
+  @param[in]  BootChain     Numeric version of the chain
+  @param[out] VendorBoot    Allocated buffer holding the image, header first
+
+  @retval EFI_SUCCESS    The operation completed successfully.
+
+**/
+STATIC
+EFI_STATUS
+EFIAPI
+ReadVendorBootImage (
+  IN  EFI_HANDLE  DeviceHandle,
+  IN  UINT32      BootChain,
+  OUT VOID        **VendorBoot
+  )
+{
+  EFI_STATUS             Status;
+  EFI_HANDLE             PartitionHandle;
+  EFI_BLOCK_IO_PROTOCOL  *BlockIo;
+  EFI_DISK_IO_PROTOCOL   *DiskIo;
+  VENDOR_BOOTIMG_HEADER  Header;
+  UINT32                 Offset;
+  UINT32                 PageSize;
+  UINT64                 Size;
+  UINT64                 PartitionSize;
+  VOID                   *Buffer;
+
+  Status = FindPartitionInfo (DeviceHandle, VENDOR_BOOT_BASE_NAME, BootChain, NULL, &PartitionHandle);
+  if (EFI_ERROR (Status)) {
+    ErrorPrint (L"%a: Unable to locate %s partition\r\n", __FUNCTION__, VENDOR_BOOT_BASE_NAME);
+    return Status;
+  }
+
+  Status = gBS->HandleProtocol (PartitionHandle, &gEfiBlockIoProtocolGuid, (VOID **)&BlockIo);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = gBS->HandleProtocol (PartitionHandle, &gEfiDiskIoProtocolGuid, (VOID **)&DiskIo);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Offset = 0;
+  Status = DiskIo->ReadDisk (DiskIo, BlockIo->Media->MediaId, Offset, sizeof (Header), &Header);
+  if (!EFI_ERROR (Status) && (CompareMem (Header.Magic, VENDOR_BOOT_MAGIC, VENDOR_BOOT_MAGIC_LENGTH) != 0)) {
+    Offset = PcdGet32 (PcdSignedImageHeaderSize);
+    Status = DiskIo->ReadDisk (DiskIo, BlockIo->Media->MediaId, Offset, sizeof (Header), &Header);
+  }
+
+  if (EFI_ERROR (Status)) {
+    ErrorPrint (L"Failed to read disk\r\n");
+    return Status;
+  }
+
+  if (CompareMem (Header.Magic, VENDOR_BOOT_MAGIC, VENDOR_BOOT_MAGIC_LENGTH) != 0) {
+    ErrorPrint (L"%a: No vendor boot image header\r\n", __FUNCTION__);
+    return EFI_NOT_FOUND;
+  }
+
+  PageSize = Header.PageSize;
+  if ((Header.HeaderVersion < 3) || (PageSize == 0) || ((PageSize & (PageSize - 1)) != 0)) {
+    ErrorPrint (L"%a: Unsupported vendor boot header v%u, page size %u\r\n", __FUNCTION__, Header.HeaderVersion, PageSize);
+    return EFI_UNSUPPORTED;
+  }
+
+  if (Header.HeaderVersion < 4) {
+    Header.VendorRamdiskTableSize = 0;
+    Header.BootconfigSize         = 0;
+  }
+
+  Size = (UINT64)ALIGN_VALUE (Header.HeaderSize, PageSize) +
+         ALIGN_VALUE (Header.VendorRamdiskSize, PageSize) +
+         ALIGN_VALUE (Header.DtbSize, PageSize) +
+         ALIGN_VALUE (Header.VendorRamdiskTableSize, PageSize) +
+         ALIGN_VALUE (Header.BootconfigSize, PageSize);
+  PartitionSize = MultU64x32 (BlockIo->Media->LastBlock + 1, BlockIo->Media->BlockSize);
+  if (Offset + Size > PartitionSize) {
+    ErrorPrint (L"%a: Vendor boot image (%lu bytes) larger than its partition\r\n", __FUNCTION__, Size);
+    return EFI_VOLUME_CORRUPTED;
+  }
+
+  Buffer = AllocatePool (Size);
+  if (Buffer == NULL) {
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  Status = DiskIo->ReadDisk (DiskIo, BlockIo->Media->MediaId, Offset, Size, Buffer);
+  if (EFI_ERROR (Status)) {
+    ErrorPrint (L"Failed to read disk\r\n");
+    FreePool (Buffer);
+    return Status;
+  }
+
+  // Keep the v3 adjustments in the returned copy.
+  CopyMem (Buffer, &Header, sizeof (Header));
+  *VendorBoot = Buffer;
+  return EFI_SUCCESS;
+}
+
+/**
+  Append space separated arguments to an ASCII kernel command line
+
+  @param[in, out] Cmdline  Command line of MAX_KERNEL_CMDLINE_SIZE bytes
+  @param[in]      Args     Arguments, not necessarily NUL terminated
+  @param[in]      ArgsMax  Maximum length of Args
+
+**/
+STATIC
+VOID
+EFIAPI
+AppendCmdline (
+  IN OUT CHAR8        *Cmdline,
+  IN     CONST CHAR8  *Args,
+  IN     UINTN        ArgsMax
+  )
+{
+  UINTN  Used;
+  UINTN  Length;
+
+  Length = AsciiStrnLenS (Args, ArgsMax);
+  if (Length == 0) {
+    return;
+  }
+
+  Used = AsciiStrLen (Cmdline);
+  if (Used + 1 + Length + 1 > MAX_KERNEL_CMDLINE_SIZE) {
+    ErrorPrint (L"%a: Kernel command line too long, dropping %u bytes\r\n", __FUNCTION__, Length);
+    return;
+  }
+
+  if (Used != 0) {
+    Cmdline[Used++] = ' ';
+  }
+
+  CopyMem (Cmdline + Used, Args, Length);
+  Cmdline[Used + Length] = '\0';
+}
+
+/**
+  Boot a v3/v4 boot image together with its vendor_boot image
+
+  The initrd is the vendor ramdisk, then the generic ramdisk, then the vendor bootconfig
+  with its trailer; it reaches the kernel EFI stub through LoadFile2. The command line is
+  the DT bootargs, the vendor and boot image command lines, the Android boot properties
+  and the platform additions.
+
+  @param[in]  DeviceHandle  The handle of partition where this file lives on.
+  @param[in]  Image         The boot image, header first
+  @param[in]  BootParams    The current boot parameters
+
+  @retval EFI_SUCCESS    The operation completed successfully.
+
+**/
+STATIC
+EFI_STATUS
+EFIAPI
+BootAndroidV3Image (
+  IN EFI_HANDLE       DeviceHandle,
+  IN VOID             *Image,
+  IN L4T_BOOT_PARAMS  *BootParams
+  )
+{
+  EFI_STATUS                 Status;
+  ANDROID_BOOTIMG_V3_HEADER  *Header;
+  VENDOR_BOOTIMG_HEADER      *VendorHeader;
+  VOID                       *VendorBoot;
+  UINT8                      *VendorSection;
+  UINT32                     PageSize;
+  UINT8                      *Kernel;
+  UINT8                      *Ramdisk;
+  UINT8                      *Bootconfig;
+  UINT8                      *Trailer;
+  UINT32                     Checksum;
+  UINTN                      Index;
+  CHAR8                      *Cmdline;
+  CHAR16                     *Cmdline16;
+  CHAR8                      Args[64];
+  VOID                       *Fdt;
+  INTN                       NodeOffset;
+  CONST CHAR8                *Bootargs;
+  INT32                      BootargsLength;
+  ANDROID_BOOTIMG_PROTOCOL   *AndroidBootImg;
+  KERNEL_DEVICE_PATH         KernelDevicePath;
+  EFI_HANDLE                 KernelHandle;
+  EFI_HANDLE                 InitrdHandle;
+  EFI_LOADED_IMAGE_PROTOCOL  *KernelImage;
+
+  Header       = (ANDROID_BOOTIMG_V3_HEADER *)Image;
+  VendorBoot   = NULL;
+  mInitrd      = NULL;
+  Cmdline      = NULL;
+  Cmdline16    = NULL;
+  KernelHandle = NULL;
+  InitrdHandle = NULL;
+
+  Status = ReadVendorBootImage (DeviceHandle, BootParams->BootChain, &VendorBoot);
+  if (EFI_ERROR (Status)) {
+    goto Exit;
+  }
+
+  VendorHeader  = (VENDOR_BOOTIMG_HEADER *)VendorBoot;
+  PageSize      = VendorHeader->PageSize;
+  VendorSection = (UINT8 *)VendorBoot + ALIGN_VALUE (VendorHeader->HeaderSize, PageSize);
+  Bootconfig    = VendorSection +
+                  ALIGN_VALUE (VendorHeader->VendorRamdiskSize, PageSize) +
+                  ALIGN_VALUE (VendorHeader->DtbSize, PageSize) +
+                  ALIGN_VALUE (VendorHeader->VendorRamdiskTableSize, PageSize);
+
+  Kernel  = (UINT8 *)Image + ANDROID_BOOTIMG_V3_PAGE_SIZE;
+  Ramdisk = Kernel + ALIGN_VALUE (Header->KernelSize, ANDROID_BOOTIMG_V3_PAGE_SIZE);
+
+  // All vendor ramdisk fragments are loaded: there is no board id to select by.
+  mInitrdSize = VendorHeader->VendorRamdiskSize + Header->RamdiskSize;
+  if (VendorHeader->BootconfigSize != 0) {
+    mInitrdSize += VendorHeader->BootconfigSize + BOOTCONFIG_TRAILER_SIZE;
+  }
+
+  mInitrd = AllocatePool (mInitrdSize);
+  if (mInitrd == NULL) {
+    Status = EFI_OUT_OF_RESOURCES;
+    goto Exit;
+  }
+
+  CopyMem (mInitrd, VendorSection, VendorHeader->VendorRamdiskSize);
+  CopyMem ((UINT8 *)mInitrd + VendorHeader->VendorRamdiskSize, Ramdisk, Header->RamdiskSize);
+  if (VendorHeader->BootconfigSize != 0) {
+    Trailer = (UINT8 *)mInitrd + VendorHeader->VendorRamdiskSize + Header->RamdiskSize;
+    CopyMem (Trailer, Bootconfig, VendorHeader->BootconfigSize);
+    Checksum = 0;
+    for (Index = 0; Index < VendorHeader->BootconfigSize; Index++) {
+      Checksum += Bootconfig[Index];
+    }
+
+    Trailer += VendorHeader->BootconfigSize;
+    WriteUnaligned32 ((UINT32 *)Trailer, VendorHeader->BootconfigSize);
+    WriteUnaligned32 ((UINT32 *)(Trailer + sizeof (UINT32)), Checksum);
+    CopyMem (Trailer + 2 * sizeof (UINT32), BOOTCONFIG_MAGIC, BOOTCONFIG_MAGIC_LENGTH);
+  }
+
+  Cmdline   = AllocateZeroPool (MAX_KERNEL_CMDLINE_SIZE);
+  Cmdline16 = AllocateZeroPool (MAX_KERNEL_CMDLINE_SIZE * sizeof (CHAR16));
+  if ((Cmdline == NULL) || (Cmdline16 == NULL)) {
+    Status = EFI_OUT_OF_RESOURCES;
+    goto Exit;
+  }
+
+  // The EFI stub replaces /chosen/bootargs with the load options, so carry them over.
+  Status = EfiGetSystemConfigurationTable (&gFdtTableGuid, &Fdt);
+  if (!EFI_ERROR (Status)) {
+    NodeOffset = fdt_path_offset (Fdt, "/chosen");
+    if (NodeOffset >= 0) {
+      Bootargs = fdt_getprop (Fdt, NodeOffset, "bootargs", &BootargsLength);
+      if ((Bootargs != NULL) && (BootargsLength > 0)) {
+        AppendCmdline (Cmdline, Bootargs, BootargsLength);
+      }
+    }
+  }
+
+  AppendCmdline (Cmdline, VendorHeader->Cmdline, VENDOR_BOOT_CMDLINE_SIZE);
+  AppendCmdline (Cmdline, Header->Cmdline, ANDROID_BOOTIMG_V3_CMDLINE_SIZE);
+  AsciiSPrint (
+    Args,
+    sizeof (Args),
+    "androidboot.slot_suffix=_%c androidboot.verifiedbootstate=orange",
+    'a' + BootParams->BootChain
+    );
+  AppendCmdline (Cmdline, Args, sizeof (Args));
+
+  Status = AsciiStrToUnicodeStrS (Cmdline, Cmdline16, MAX_KERNEL_CMDLINE_SIZE);
+  if (EFI_ERROR (Status)) {
+    goto Exit;
+  }
+
+  Status = gBS->LocateProtocol (&gAndroidBootImgProtocolGuid, NULL, (VOID **)&AndroidBootImg);
+  if (!EFI_ERROR (Status) && (AndroidBootImg->AppendArgs != NULL)) {
+    Status = AndroidBootImg->AppendArgs (Cmdline16, MAX_KERNEL_CMDLINE_SIZE * sizeof (CHAR16));
+    if (EFI_ERROR (Status)) {
+      ErrorPrint (L"%a: Failed to append platform kernel args: %r\r\n", __FUNCTION__, Status);
+    }
+  }
+
+  DEBUG ((DEBUG_ERROR, "%a: Cmdline: %s\n", __FUNCTION__, Cmdline16));
+
+  Status = gBS->InstallMultipleProtocolInterfaces (
+                  &InitrdHandle,
+                  &gEfiLoadFile2ProtocolGuid,
+                  &mInitrdLoadFile2,
+                  &gEfiDevicePathProtocolGuid,
+                  &mInitrdDevicePath,
+                  NULL
+                  );
+  if (EFI_ERROR (Status)) {
+    ErrorPrint (L"%a: Failed to install initrd LoadFile2: %r\r\n", __FUNCTION__, Status);
+    InitrdHandle = NULL;
+    goto Exit;
+  }
+
+  KernelDevicePath                       = mKernelDevicePathTemplate;
+  KernelDevicePath.Node1.StartingAddress = (EFI_PHYSICAL_ADDRESS)(UINTN)Kernel;
+  KernelDevicePath.Node1.EndingAddress   = (EFI_PHYSICAL_ADDRESS)(UINTN)Kernel + Header->KernelSize;
+
+  Status = gBS->LoadImage (
+                  TRUE,
+                  gImageHandle,
+                  (EFI_DEVICE_PATH *)&KernelDevicePath,
+                  Kernel,
+                  Header->KernelSize,
+                  &KernelHandle
+                  );
+  if (EFI_ERROR (Status)) {
+    ErrorPrint (L"%a: Failed to load kernel: %r\r\n", __FUNCTION__, Status);
+    goto Exit;
+  }
+
+  Status = gBS->HandleProtocol (KernelHandle, &gEfiLoadedImageProtocolGuid, (VOID **)&KernelImage);
+  if (EFI_ERROR (Status)) {
+    goto Exit;
+  }
+
+  KernelImage->LoadOptions     = Cmdline16;
+  KernelImage->LoadOptionsSize = (UINT32)StrSize (Cmdline16);
+
+  // Same watchdog as AndroidBootImgBoot: 5 minutes for the kernel to take over
+  gBS->SetWatchdogTimer (5 * 60, 0x10000, 0, NULL);
+  Status = gBS->StartImage (KernelHandle, NULL, NULL);
+  gBS->SetWatchdogTimer (0, 0x10000, 0, NULL);
+  ErrorPrint (L"%a: Kernel returned: %r\r\n", __FUNCTION__, Status);
+
+Exit:
+  if (KernelHandle != NULL) {
+    gBS->UnloadImage (KernelHandle);
+  }
+
+  if (InitrdHandle != NULL) {
+    gBS->UninstallMultipleProtocolInterfaces (
+           InitrdHandle,
+           &gEfiLoadFile2ProtocolGuid,
+           &mInitrdLoadFile2,
+           &gEfiDevicePathProtocolGuid,
+           &mInitrdDevicePath,
+           NULL
+           );
+  }
+
+  if (mInitrd != NULL) {
+    FreePool (mInitrd);
+    mInitrd = NULL;
+  }
+
+  if (Cmdline != NULL) {
+    FreePool (Cmdline);
+  }
+
+  if (Cmdline16 != NULL) {
+    FreePool (Cmdline16);
+  }
+
+  if (VendorBoot != NULL) {
+    FreePool (VendorBoot);
+  }
+
+  return EFI_ERROR (Status) ? Status : EFI_LOAD_ERROR;
+}
+
 /**
   Boots an android style partition located with Partition base name and bootchain
 
@@ -440,7 +927,7 @@ BootAndroidStylePartition (
     goto Exit;
   }
 
-  Status = AndroidBootImgGetImgSize (&ImageHeader, &ImageSize);
+  Status = GetBootImgSize (&ImageHeader, &ImageSize);
   if (EFI_ERROR (Status)) {
     Offset = FixedPcdGet32 (PcdSignedImageHeaderSize);
     Status = DiskIo->ReadDisk (
@@ -455,7 +942,7 @@ BootAndroidStylePartition (
       goto Exit;
     }
 
-    Status = AndroidBootImgGetImgSize (&ImageHeader, &ImageSize);
+    Status = GetBootImgSize (&ImageHeader, &ImageSize);
     if (EFI_ERROR (Status)) {
       ErrorPrint (L"Header not seen at either offset 0 or offset 0x%x\r\n", Offset);
       goto Exit;
@@ -568,10 +1055,15 @@ BootAndroidStylePartition (
     }
   }
 
-  DEBUG ((DEBUG_ERROR, "%a: Cmdline: \n", __FUNCTION__));
-  DEBUG ((DEBUG_ERROR, "%a", ImageHeader.KernelArgs));
+  if (((ANDROID_BOOTIMG_V3_HEADER *)Image)->HeaderVersion >= 3) {
+    Status = BootAndroidV3Image (DeviceHandle, Image, BootParams);
+  } else {
+    DEBUG ((DEBUG_ERROR, "%a: Cmdline: \n", __FUNCTION__));
+    DEBUG ((DEBUG_ERROR, "%a", ImageHeader.KernelArgs));
 
-  Status = AndroidBootImgBoot (Image, ImageSize);
+    Status = AndroidBootImgBoot (Image, ImageSize);
+  }
+
   if (EFI_ERROR (Status)) {
     ErrorPrint (L"Failed to boot image: %r\r\n", Status);
     gBS->FreePages ((EFI_PHYSICAL_ADDRESS)ExpandedDtb, EFI_SIZE_TO_PAGES (fdt_totalsize (ExpandedDtb)));

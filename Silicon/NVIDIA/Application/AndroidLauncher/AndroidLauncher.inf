@@ -52,6 +52,7 @@
   gNVIDIAPublicVariableGuid
   gFdtTableGuid
   gEfiSecureBootEnableDisableGuid
+  gLinuxEfiInitrdMediaGuid
 
 [Protocols]
   gEfiLoadedImageProtocolGuid
